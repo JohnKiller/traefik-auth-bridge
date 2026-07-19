@@ -15,9 +15,9 @@ The middleware trusts a successful code redemption response from the configured 
 
 ## Authorization request
 
-For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It redirects to `authorizationURL` and places that URL in `returnURLParameter`.
+For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It generates 32 random bytes, stores the Base64URL value in a temporary host-only `HttpOnly` cookie, and redirects to `authorizationURL`. The original URL is placed in `returnURLParameter` and the random value in `stateParameter`.
 
-The portal must treat the return URL as untrusted input. It must validate the scheme, origin, callback path, and service registration before presenting or completing authorization. A suffix-only hostname check is not sufficient for a general-purpose deployment.
+The portal must treat the return URL as untrusted input. It must validate the scheme, origin, callback path, and service registration before presenting or completing authorization. A suffix-only hostname check is not sufficient for a general-purpose deployment. The portal must preserve the state value and bind it to the authorization grant.
 
 The portal is responsible for authenticating the user and deciding whether that user may access the requested service.
 
@@ -32,13 +32,14 @@ SHA-256(code) -> {
     return_url,
     subject,
     service_id,
+    state,
     expires_at
 }
 ```
 
 The exact record may contain additional policy or identity information. The plaintext code should not be stored when a hash is sufficient.
 
-The portal redirects the browser to the registered callback path on the protected origin. The code is carried in the configured callback query parameter.
+The portal redirects the browser to the registered callback path on the protected origin. The code and unchanged state are carried in their configured callback query parameters.
 
 Codes must be:
 
@@ -50,7 +51,7 @@ Codes must be:
 
 ## Code redemption
 
-The middleware intercepts `callbackPath`; the upstream service never receives this request. It sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST.
+The middleware intercepts `callbackPath`; the upstream service never receives this request. Before redemption, it compares the callback state with the temporary host-only cookie using a constant-time comparison and consumes the cookie. A missing or mismatched value is rejected without contacting the portal. It then sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST.
 
 The portal must perform an atomic lookup-and-delete operation. Concurrent redemption attempts for the same code must result in at most one successful response.
 
@@ -59,7 +60,8 @@ A successful response is:
 ```json
 {
   "active": true,
-  "rd": "https://service.example.org/original/path"
+  "rd": "https://service.example.org/original/path",
+  "state": "browser-state"
 }
 ```
 
@@ -67,6 +69,7 @@ The middleware accepts the response only when:
 
 - the HTTP status is `200`;
 - the body is valid JSON and `active` is `true`;
+- the redeemed state matches the callback and browser state;
 - `rd` is an absolute HTTPS URL;
 - the `rd` authority exactly matches the authority of the callback request.
 
@@ -142,11 +145,11 @@ This middleware controls whether a request may reach an upstream service. It doe
 
 `SameSite=Lax` reduces some cross-site cookie delivery but is not a substitute for CSRF protection in state-changing upstream applications.
 
-## Known protocol gap: login initiation binding
+## Browser binding with state
 
-The current protocol does not bind the authorization flow to the browser that initiated it. A future protocol version may add a random `state` value stored in a temporary host-only cookie and returned by the portal.
+The temporary state cookie binds the authorization grant to the browser that initiated the flow. A callback URL copied to another browser fails because that browser does not possess the matching host-only `HttpOnly` cookie. Authenticated redemption also confirms that the portal bound the same state to the one-time code.
 
-The one-time code prevents replay after redemption, but without `state`, a still-valid callback URL may be transferred to another browser before it is consumed. Deployments should use short code lifetimes and avoid logging callback query strings.
+State is consumed when callback processing starts. A failed or interrupted redeem therefore requires a new authorization flow. This fail-closed behavior prevents repeated attempts with the same browser state.
 
 ## Operational recommendations
 
@@ -154,6 +157,7 @@ The one-time code prevents replay after redemption, but without `state`, a still
 - Avoid recording authorization codes in access logs, analytics, and referrer data.
 - Restrict portal return URLs to registered origins and callback paths.
 - Consume authorization codes atomically.
+- Preserve state in the portal grant and return it from both callback and redeem.
 - Use at least 32 random bytes for the master key.
 - Keep the master key readable only by the Traefik process.
 - Use a stable and unique `serviceID` for each security boundary.
