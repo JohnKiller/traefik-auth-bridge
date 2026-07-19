@@ -64,7 +64,8 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
 | `serviceID` | yes | — | Stable, unique identifier used to derive the service-specific HMAC key. |
-| `masterKeyFile` | yes | — | File containing at least 32 bytes of random master key material. |
+| `masterKeyFile` | one of the two | — | File containing at least 32 bytes of random master key material. Recommended for production. |
+| `masterKey` | one of the two | — | Inline master key of at least 32 bytes. Intended for testing because configuration systems may expose it. |
 | `authorizationURL` | yes | — | Absolute URL of the portal authorization page. Existing query parameters are preserved. |
 | `returnURLParameter` | no | `rd` | Query parameter added to `authorizationURL` with the original absolute request URL. |
 | `callbackPath` | no | `/_auth/callback` | Path intercepted by the middleware to receive the authorization code. |
@@ -106,6 +107,8 @@ chmod 600 auth-cookie-master-key
 ```
 
 Do not place the master key directly in Docker labels.
+
+`masterKey` and `masterKeyFile` are mutually exclusive. The inline `masterKey` option allows the Traefik Plugin Catalog to instantiate the middleware from `.traefik.yml` without an externally mounted secret. Prefer `masterKeyFile` for real deployments.
 
 ## Authorization portal requirements
 

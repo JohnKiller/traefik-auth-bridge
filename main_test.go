@@ -81,3 +81,28 @@ func TestAuthorizationRedirectUsesConfiguredParameter(t *testing.T) {
 		t.Fatalf("existing authorization URL query was not preserved: %q", location)
 	}
 }
+
+func TestInlineMasterKey(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+
+	if _, err := New(context.Background(), http.NotFoundHandler(), config, "test"); err != nil {
+		t.Fatalf("inline master key was rejected: %v", err)
+	}
+}
+
+func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.MasterKeyFile = "/run/secrets/master-key"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+
+	if _, err := New(context.Background(), http.NotFoundHandler(), config, "test"); err == nil {
+		t.Fatal("configuration with both master key sources was accepted")
+	}
+}
