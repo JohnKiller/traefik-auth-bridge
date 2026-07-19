@@ -1,0 +1,15 @@
+displayName: Traefik Auth Bridge
+type: middleware
+import: github.com/JohnKiller/traefik-auth-bridge
+summary: Protects upstream services through an external authorization portal and stateless signed cookies.
+testData:
+  cookieName: __Host-traefik-auth
+  cookieTTL: 3600
+  serviceID: example-service
+  masterKeyFile: /run/secrets/cookie-master-key
+  authorizationURL: https://login.example.com/authorize
+  returnURLParameter: rd
+  callbackPath: /_auth/callback
+  authorizationCodeParameter: code
+  redeemURL: https://login.example.com/redeem
+  redeemCodeParameter: code
