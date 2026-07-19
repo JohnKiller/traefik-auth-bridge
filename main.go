@@ -22,6 +22,7 @@ type Config struct {
 	CookieName                 string `json:"cookieName,omitempty"`
 	CookieTTL                  int    `json:"cookieTTL,omitempty"`
 	ServiceID                  string `json:"serviceID,omitempty"`
+	MasterKey                  string `json:"masterKey,omitempty"`
 	MasterKeyFile              string `json:"masterKeyFile,omitempty"`
 	AuthorizationURL           string `json:"authorizationURL,omitempty"`
 	ReturnURLParameter         string `json:"returnURLParameter,omitempty"`
@@ -88,12 +89,20 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	if config.ServiceID == "" {
 		return nil, fmt.Errorf("serviceID is required")
 	}
-	if config.MasterKeyFile == "" {
-		return nil, fmt.Errorf("masterKeyFile is required")
+	if config.MasterKey == "" && config.MasterKeyFile == "" {
+		return nil, fmt.Errorf("one of masterKey or masterKeyFile is required")
 	}
-	masterKey, err := os.ReadFile(config.MasterKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("read master key: %w", err)
+	if config.MasterKey != "" && config.MasterKeyFile != "" {
+		return nil, fmt.Errorf("masterKey and masterKeyFile are mutually exclusive")
+	}
+
+	masterKey := []byte(config.MasterKey)
+	if config.MasterKeyFile != "" {
+		var err error
+		masterKey, err = os.ReadFile(config.MasterKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read master key: %w", err)
+		}
 	}
 	if len(masterKey) < 32 {
 		return nil, fmt.Errorf("master key must contain at least 32 bytes")

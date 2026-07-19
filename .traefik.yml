@@ -6,7 +6,7 @@ testData:
   cookieName: __Host-traefik-auth
   cookieTTL: 3600
   serviceID: example-service
-  masterKeyFile: /run/secrets/cookie-master-key
+  masterKey: catalog-validation-master-key-32-bytes
   authorizationURL: https://login.example.com/authorize
   returnURLParameter: rd
   callbackPath: /_auth/callback
