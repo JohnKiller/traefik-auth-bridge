@@ -1,7 +1,7 @@
 displayName: Traefik Auth Bridge
 type: middleware
 import: github.com/JohnKiller/traefik-auth-bridge
-summary: Protects upstream services through an external authorization portal and stateless signed cookies.
+summary: A session-oriented alternative to ForwardAuth using an external authorization portal, one-time codes, browser state, and signed cookies.
 testData:
   cookieName: __Host-traefik-auth
   cookieTTL: 3600

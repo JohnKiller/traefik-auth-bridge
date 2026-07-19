@@ -4,6 +4,7 @@ package traefik_auth_bridge
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -26,6 +27,9 @@ type Config struct {
 	MasterKeyFile              string `json:"masterKeyFile,omitempty"`
 	AuthorizationURL           string `json:"authorizationURL,omitempty"`
 	ReturnURLParameter         string `json:"returnURLParameter,omitempty"`
+	StateParameter             string `json:"stateParameter,omitempty"`
+	StateCookieName            string `json:"stateCookieName,omitempty"`
+	StateTTL                   int    `json:"stateTTL,omitempty"`
 	CallbackPath               string `json:"callbackPath,omitempty"`
 	AuthorizationCodeParameter string `json:"authorizationCodeParameter,omitempty"`
 	RedeemURL                  string `json:"redeemURL,omitempty"`
@@ -38,6 +42,9 @@ func CreateConfig() *Config {
 		CookieName:                 "__Host-traefik-auth",
 		CookieTTL:                  3600,
 		ReturnURLParameter:         "rd",
+		StateParameter:             "state",
+		StateCookieName:            "__Host-traefik-auth-state",
+		StateTTL:                   300,
 		CallbackPath:               "/_auth/callback",
 		AuthorizationCodeParameter: "code",
 		RedeemCodeParameter:        "code",
@@ -53,6 +60,9 @@ type CookieAuth struct {
 	signingKey                 []byte
 	authorizationURL           *url.URL
 	returnURLParameter         string
+	stateParameter             string
+	stateCookieName            string
+	stateTTL                   int
 	callbackPath               string
 	authorizationCodeParameter string
 	redeemURL                  string
@@ -70,6 +80,15 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	}
 	if config.ReturnURLParameter == "" {
 		return nil, fmt.Errorf("returnURLParameter is required")
+	}
+	if config.StateParameter == "" {
+		return nil, fmt.Errorf("stateParameter is required")
+	}
+	if config.StateCookieName == "" {
+		return nil, fmt.Errorf("stateCookieName is required")
+	}
+	if config.StateTTL <= 0 {
+		return nil, fmt.Errorf("stateTTL must be greater than zero")
 	}
 	if config.CallbackPath == "" || config.CallbackPath[0] != '/' {
 		return nil, fmt.Errorf("callbackPath must start with /")
@@ -124,6 +143,9 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		signingKey:                 signingKey,
 		authorizationURL:           authorizationURL,
 		returnURLParameter:         config.ReturnURLParameter,
+		stateParameter:             config.StateParameter,
+		stateCookieName:            config.StateCookieName,
+		stateTTL:                   config.StateTTL,
 		callbackPath:               config.CallbackPath,
 		authorizationCodeParameter: config.AuthorizationCodeParameter,
 		redeemURL:                  config.RedeemURL,
@@ -150,12 +172,29 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		originalScheme = "https"
 	}
 	originalURL := originalScheme + "://" + req.Host + req.URL.RequestURI()
+	stateBytes := make([]byte, 32)
+	if _, err := rand.Read(stateBytes); err != nil {
+		http.Error(rw, "unable to start authorization", http.StatusInternalServerError)
+		return
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
 
 	redirectURL := *m.authorizationURL
 	query := redirectURL.Query()
 	query.Set(m.returnURLParameter, originalURL)
+	query.Set(m.stateParameter, state)
 	redirectURL.RawQuery = query.Encode()
 
+	http.SetCookie(rw, &http.Cookie{
+		Name:     m.stateCookieName,
+		Value:    state,
+		Path:     "/",
+		MaxAge:   m.stateTTL,
+		Expires:  time.Now().Add(time.Duration(m.stateTTL) * time.Second).UTC(),
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 	rw.Header().Set("Cache-Control", "no-store")
 	http.Redirect(rw, req, redirectURL.String(), http.StatusFound)
 }
@@ -194,6 +233,14 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 		http.Error(rw, "missing authorization code", http.StatusUnauthorized)
 		return
 	}
+	callbackState := req.URL.Query().Get(m.stateParameter)
+	stateCookie, err := req.Cookie(m.stateCookieName)
+	if callbackState == "" || err != nil || !hmac.Equal([]byte(callbackState), []byte(stateCookie.Value)) {
+		m.clearStateCookie(rw)
+		http.Error(rw, "invalid authorization state", http.StatusUnauthorized)
+		return
+	}
+	m.clearStateCookie(rw)
 
 	form := url.Values{}
 	form.Set(m.redeemCodeParameter, code)
@@ -219,9 +266,14 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 	var grant struct {
 		Active bool   `json:"active"`
 		RD     string `json:"rd"`
+		State  string `json:"state"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 8192)).Decode(&grant); err != nil || !grant.Active {
 		http.Error(rw, "invalid authorization response", http.StatusBadGateway)
+		return
+	}
+	if !hmac.Equal([]byte(grant.State), []byte(callbackState)) {
+		http.Error(rw, "authorization state mismatch", http.StatusUnauthorized)
 		return
 	}
 	parsed, err := url.Parse(grant.RD)
@@ -243,4 +295,17 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 	})
 	rw.Header().Set("Cache-Control", "no-store")
 	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
+}
+
+func (m *CookieAuth) clearStateCookie(rw http.ResponseWriter) {
+	http.SetCookie(rw, &http.Cookie{
+		Name:     m.stateCookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0).UTC(),
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 }

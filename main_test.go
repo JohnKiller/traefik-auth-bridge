@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -80,6 +81,23 @@ func TestAuthorizationRedirectUsesConfiguredParameter(t *testing.T) {
 	if !strings.Contains(location, "prompt=login") {
 		t.Fatalf("existing authorization URL query was not preserved: %q", location)
 	}
+	parsedLocation, err := url.Parse(location)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := parsedLocation.Query().Get("state")
+	if state == "" {
+		t.Fatal("authorization redirect does not contain state")
+	}
+	var stateCookie *http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == config.StateCookieName {
+			stateCookie = cookie
+		}
+	}
+	if stateCookie == nil || stateCookie.Value != state {
+		t.Fatal("state cookie does not match redirect state")
+	}
 }
 
 func TestInlineMasterKey(t *testing.T) {
@@ -104,5 +122,77 @@ func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
 
 	if _, err := New(context.Background(), http.NotFoundHandler(), config, "test"); err == nil {
 		t.Fatal("configuration with both master key sources was accepted")
+	}
+}
+
+func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
+	redeemServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if err := req.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		if req.Form.Get("code") != "one-time-code" {
+			t.Errorf("unexpected code: %q", req.Form.Get("code"))
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		rw.Write([]byte(`{"active":true,"rd":"https://service.example.org/private","state":"browser-state"}`))
+	}))
+	defer redeemServer.Close()
+
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = redeemServer.URL
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=one-time-code&state=browser-state", nil)
+	request.AddCookie(&http.Cookie{Name: config.StateCookieName, Value: "browser-state"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303, got %d: %s", response.Code, response.Body.String())
+	}
+	var sessionCreated, stateCleared bool
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v1.") {
+			sessionCreated = true
+		}
+		if cookie.Name == config.StateCookieName && cookie.MaxAge < 0 {
+			stateCleared = true
+		}
+	}
+	if !sessionCreated || !stateCleared {
+		t.Fatalf("sessionCreated=%v stateCleared=%v", sessionCreated, stateCleared)
+	}
+}
+
+func TestCallbackRejectsBrowserStateMismatchBeforeRedeem(t *testing.T) {
+	redeemCalled := false
+	redeemServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redeemCalled = true
+	}))
+	defer redeemServer.Close()
+
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = redeemServer.URL
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=one-time-code&state=attacker-state", nil)
+	request.AddCookie(&http.Cookie{Name: config.StateCookieName, Value: "browser-state"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized || redeemCalled {
+		t.Fatalf("status=%d redeemCalled=%v", response.Code, redeemCalled)
 	}
 }
