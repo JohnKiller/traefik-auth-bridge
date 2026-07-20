@@ -128,6 +128,72 @@ func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestProtectedPathOnlyAuthenticatesConfiguredSubtree(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+	config.ProtectedPath = "/admin"
+
+	upstreamCalls := 0
+	handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		rw.WriteHeader(http.StatusNoContent)
+	}), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/admin", "/admin?test=1", "/admin/users"} {
+		request := httptest.NewRequest(http.MethodGet, "https://service.example.org"+path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusFound {
+			t.Errorf("%s returned %d, want 302", path, response.Code)
+		}
+	}
+
+	for _, path := range []string{"/", "/administrator", "/favicon.ico"} {
+		request := httptest.NewRequest(http.MethodGet, "https://service.example.org"+path, nil)
+		request.AddCookie(&http.Cookie{Name: config.CookieName, Value: "invalid"})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNoContent {
+			t.Errorf("%s returned %d, want 204", path, response.Code)
+		}
+		if len(response.Result().Cookies()) != 0 {
+			t.Errorf("%s created cookies outside the protected path", path)
+		}
+	}
+
+	if upstreamCalls != 3 {
+		t.Fatalf("upstream called %d times, want 3", upstreamCalls)
+	}
+}
+
+func TestProtectedPathValidationAndNormalization(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+	config.ProtectedPath = "admin"
+	if _, err := New(context.Background(), http.NotFoundHandler(), config, "test"); err == nil {
+		t.Fatal("protectedPath without a leading slash was accepted")
+	}
+
+	config.ProtectedPath = "/admin///"
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	middleware := handler.(*CookieAuth)
+	if middleware.protectedPath != "/admin" || middleware.protectedPathPrefix != "/admin/" {
+		t.Fatalf("protected path normalized to %q with prefix %q", middleware.protectedPath, middleware.protectedPathPrefix)
+	}
+}
+
 func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	redeemServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if err := req.ParseForm(); err != nil {
@@ -146,6 +212,7 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = redeemServer.URL
+	config.ProtectedPath = "/private"
 	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
 	if err != nil {
 		t.Fatal(err)

@@ -30,6 +30,7 @@ type Config struct {
 	StateParameter             string `json:"stateParameter,omitempty"`
 	StateCookieName            string `json:"stateCookieName,omitempty"`
 	StateTTL                   int    `json:"stateTTL,omitempty"`
+	ProtectedPath              string `json:"protectedPath,omitempty"`
 	CallbackPath               string `json:"callbackPath,omitempty"`
 	AuthorizationCodeParameter string `json:"authorizationCodeParameter,omitempty"`
 	RedeemURL                  string `json:"redeemURL,omitempty"`
@@ -45,6 +46,7 @@ func CreateConfig() *Config {
 		StateParameter:             "state",
 		StateCookieName:            "__Host-traefik-auth-state",
 		StateTTL:                   300,
+		ProtectedPath:              "/",
 		CallbackPath:               "/_auth/callback",
 		AuthorizationCodeParameter: "code",
 		RedeemCodeParameter:        "code",
@@ -63,6 +65,8 @@ type CookieAuth struct {
 	stateParameter             string
 	stateCookieName            string
 	stateTTL                   int
+	protectedPath              string
+	protectedPathPrefix        string
 	callbackPath               string
 	authorizationCodeParameter string
 	redeemURL                  string
@@ -89,6 +93,9 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	}
 	if config.StateTTL <= 0 {
 		return nil, fmt.Errorf("stateTTL must be greater than zero")
+	}
+	if config.ProtectedPath == "" || config.ProtectedPath[0] != '/' {
+		return nil, fmt.Errorf("protectedPath must start with /")
 	}
 	if config.CallbackPath == "" || config.CallbackPath[0] != '/' {
 		return nil, fmt.Errorf("callbackPath must start with /")
@@ -134,6 +141,14 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	if err != nil || authorizationURL.Scheme == "" || authorizationURL.Host == "" {
 		return nil, fmt.Errorf("authorizationURL must be an absolute URL")
 	}
+	protectedPath := strings.TrimRight(config.ProtectedPath, "/")
+	if protectedPath == "" {
+		protectedPath = "/"
+	}
+	protectedPathPrefix := protectedPath
+	if protectedPath != "/" {
+		protectedPathPrefix += "/"
+	}
 
 	return &CookieAuth{
 		next:                       next,
@@ -146,6 +161,8 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		stateParameter:             config.StateParameter,
 		stateCookieName:            config.StateCookieName,
 		stateTTL:                   config.StateTTL,
+		protectedPath:              protectedPath,
+		protectedPathPrefix:        protectedPathPrefix,
 		callbackPath:               config.CallbackPath,
 		authorizationCodeParameter: config.AuthorizationCodeParameter,
 		redeemURL:                  config.RedeemURL,
@@ -158,6 +175,10 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.URL.Path == m.callbackPath {
 		m.handleCallback(rw, req)
+		return
+	}
+	if m.protectedPath != "/" && req.URL.Path != m.protectedPath && !strings.HasPrefix(req.URL.Path, m.protectedPathPrefix) {
+		m.next.ServeHTTP(rw, req)
 		return
 	}
 

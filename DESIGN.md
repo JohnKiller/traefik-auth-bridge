@@ -17,6 +17,8 @@ The middleware trusts a successful code redemption response from the configured 
 
 For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It generates 32 random bytes, stores the Base64URL value in a temporary host-only `HttpOnly` cookie whose name is derived from the state, and redirects to `authorizationURL`. The original URL is placed in `returnURLParameter` and the random value in `stateParameter`. Flow-specific cookie names allow multiple authorization requests from the same browser to remain pending without overwriting each other.
 
+When `protectedPath` is narrower than `/`, requests outside that exact path segment and its descendants pass directly to the upstream without cookie inspection. The callback path is always intercepted, including when it lies outside the protected subtree.
+
 The portal must treat the return URL as untrusted input. It must validate the scheme, origin, callback path, and service registration before presenting or completing authorization. A suffix-only hostname check is not sufficient for a general-purpose deployment. The portal must preserve the state value and bind it to the authorization grant.
 
 The portal is responsible for authenticating the user and deciding whether that user may access the requested service.

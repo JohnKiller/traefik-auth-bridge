@@ -71,6 +71,7 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 | `stateParameter` | no | `state` | Query parameter carrying the browser-bound state through authorization and callback. |
 | `stateCookieName` | no | `__Host-traefik-auth-state` | Prefix for temporary, flow-specific host-only cookies used to bind concurrent flows to the initiating browser. |
 | `stateTTL` | no | `300` | Lifetime of the temporary state cookie in seconds. |
+| `protectedPath` | no | `/` | Absolute path subtree that requires authentication. `/admin` protects `/admin` and `/admin/...`, but not `/administrator`. |
 | `callbackPath` | no | `/_auth/callback` | Path intercepted by the middleware to receive the authorization code. |
 | `authorizationCodeParameter` | no | `code` | Query parameter containing the code on the browser callback. |
 | `redeemURL` | yes | — | Portal endpoint called by the middleware to redeem a code. |
@@ -90,6 +91,7 @@ labels:
   - traefik.http.middlewares.app-auth.plugin.authbridge.returnURLParameter=return_to
   - traefik.http.middlewares.app-auth.plugin.authbridge.stateParameter=state
   - traefik.http.middlewares.app-auth.plugin.authbridge.stateTTL=300
+  - traefik.http.middlewares.app-auth.plugin.authbridge.protectedPath=/private
   - traefik.http.middlewares.app-auth.plugin.authbridge.callbackPath=/_auth/callback
   - traefik.http.middlewares.app-auth.plugin.authbridge.authorizationCodeParameter=code
   - traefik.http.middlewares.app-auth.plugin.authbridge.redeemURL=https://login.example.net/redeem
