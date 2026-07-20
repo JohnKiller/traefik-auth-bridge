@@ -186,7 +186,7 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	redirectURL.RawQuery = query.Encode()
 
 	http.SetCookie(rw, &http.Cookie{
-		Name:     m.stateCookieName,
+		Name:     m.stateCookieNameFor(state),
 		Value:    state,
 		Path:     "/",
 		MaxAge:   m.stateTTL,
@@ -234,13 +234,20 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	callbackState := req.URL.Query().Get(m.stateParameter)
-	stateCookie, err := req.Cookie(m.stateCookieName)
-	if callbackState == "" || err != nil || !hmac.Equal([]byte(callbackState), []byte(stateCookie.Value)) {
-		m.clearStateCookie(rw)
+	if callbackState == "" {
 		http.Error(rw, "invalid authorization state", http.StatusUnauthorized)
 		return
 	}
-	m.clearStateCookie(rw)
+	stateCookieName := m.stateCookieNameFor(callbackState)
+	stateCookie, err := req.Cookie(stateCookieName)
+	if err != nil || !hmac.Equal([]byte(callbackState), []byte(stateCookie.Value)) {
+		if err == nil {
+			m.clearStateCookie(rw, stateCookieName)
+		}
+		http.Error(rw, "invalid authorization state", http.StatusUnauthorized)
+		return
+	}
+	m.clearStateCookie(rw, stateCookieName)
 
 	form := url.Values{}
 	form.Set(m.redeemCodeParameter, code)
@@ -282,6 +289,7 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	m.clearPendingStateCookies(rw, req, stateCookieName)
 	expiresAt := time.Now().Add(time.Duration(m.cookieTTL) * time.Second)
 	http.SetCookie(rw, &http.Cookie{
 		Name:     m.cookieName,
@@ -297,9 +305,33 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
 }
 
-func (m *CookieAuth) clearStateCookie(rw http.ResponseWriter) {
+func (m *CookieAuth) stateCookieNameFor(state string) string {
+	digest := sha256.Sum256([]byte(state))
+	return m.stateCookieName + "-" + base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+func (m *CookieAuth) isPendingStateCookie(name string) bool {
+	prefix := m.stateCookieName + "-"
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	digest, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(name, prefix))
+	return err == nil && len(digest) == sha256.Size
+}
+
+func (m *CookieAuth) clearPendingStateCookies(rw http.ResponseWriter, req *http.Request, alreadyCleared string) {
+	cleared := map[string]bool{alreadyCleared: true}
+	for _, cookie := range req.Cookies() {
+		if !cleared[cookie.Name] && m.isPendingStateCookie(cookie.Name) {
+			m.clearStateCookie(rw, cookie.Name)
+			cleared[cookie.Name] = true
+		}
+	}
+}
+
+func (m *CookieAuth) clearStateCookie(rw http.ResponseWriter, name string) {
 	http.SetCookie(rw, &http.Cookie{
-		Name:     m.stateCookieName,
+		Name:     name,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,

@@ -9,7 +9,7 @@ The upstream application does not need to implement authentication routes, callb
 ## Flow
 
 1. A request without a valid session cookie reaches the middleware.
-2. The middleware creates a temporary browser-bound `state` value and redirects the browser to `authorizationURL`, adding the original URL and state under their configured parameters.
+2. The middleware creates a temporary browser-bound `state` value, stores it in a flow-specific cookie, and redirects the browser to `authorizationURL`, adding the original URL and state under their configured parameters.
 3. The portal authenticates and authorizes the user.
 4. The portal creates a short-lived, opaque, one-time code bound to the state and redirects the browser to `callbackPath` on the original host with both values.
 5. The middleware verifies the browser state, sends the code to `redeemURL`, and verifies that the redeemed grant contains the same state.
@@ -69,7 +69,7 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 | `authorizationURL` | yes | — | Absolute URL of the portal authorization page. Existing query parameters are preserved. |
 | `returnURLParameter` | no | `rd` | Query parameter added to `authorizationURL` with the original absolute request URL. |
 | `stateParameter` | no | `state` | Query parameter carrying the browser-bound state through authorization and callback. |
-| `stateCookieName` | no | `__Host-traefik-auth-state` | Temporary host-only cookie used to bind the flow to the initiating browser. |
+| `stateCookieName` | no | `__Host-traefik-auth-state` | Prefix for temporary, flow-specific host-only cookies used to bind concurrent flows to the initiating browser. |
 | `stateTTL` | no | `300` | Lifetime of the temporary state cookie in seconds. |
 | `callbackPath` | no | `/_auth/callback` | Path intercepted by the middleware to receive the authorization code. |
 | `authorizationCodeParameter` | no | `code` | Query parameter containing the code on the browser callback. |
@@ -121,7 +121,7 @@ The portal must implement two endpoints.
 
 ### Authorization endpoint
 
-The browser is redirected to `authorizationURL`. The query parameter configured by `returnURLParameter` contains the original absolute URL, and `stateParameter` contains a cryptographically random value tied to a temporary host-only browser cookie.
+The browser is redirected to `authorizationURL`. The query parameter configured by `returnURLParameter` contains the original absolute URL, and `stateParameter` contains a cryptographically random value tied to a temporary host-only browser cookie. Each pending flow uses a distinct cookie so concurrent requests cannot overwrite one another. State cookies expire after `stateTTL` seconds and all remaining pending state cookies are cleared after a successful authorization.
 
 After authenticating and authorizing the user, the portal must:
 

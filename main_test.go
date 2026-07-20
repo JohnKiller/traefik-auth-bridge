@@ -91,12 +91,15 @@ func TestAuthorizationRedirectUsesConfiguredParameter(t *testing.T) {
 	}
 	var stateCookie *http.Cookie
 	for _, cookie := range response.Result().Cookies() {
-		if cookie.Name == config.StateCookieName {
+		if cookie.Name == handler.(*CookieAuth).stateCookieNameFor(state) {
 			stateCookie = cookie
 		}
 	}
 	if stateCookie == nil || stateCookie.Value != state {
 		t.Fatal("state cookie does not match redirect state")
+	}
+	if stateCookie.MaxAge != 300 {
+		t.Fatalf("state cookie MaxAge=%d, want 300", stateCookie.MaxAge)
 	}
 }
 
@@ -149,24 +152,30 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=one-time-code&state=browser-state", nil)
-	request.AddCookie(&http.Cookie{Name: config.StateCookieName, Value: "browser-state"})
+	stateCookieName := handler.(*CookieAuth).stateCookieNameFor("browser-state")
+	request.AddCookie(&http.Cookie{Name: stateCookieName, Value: "browser-state"})
+	otherStateCookieName := handler.(*CookieAuth).stateCookieNameFor("other-browser-state")
+	request.AddCookie(&http.Cookie{Name: otherStateCookieName, Value: "other-browser-state"})
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusSeeOther {
 		t.Fatalf("expected 303, got %d: %s", response.Code, response.Body.String())
 	}
-	var sessionCreated, stateCleared bool
+	var sessionCreated, stateCleared, otherStateCleared bool
 	for _, cookie := range response.Result().Cookies() {
 		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v1.") {
 			sessionCreated = true
 		}
-		if cookie.Name == config.StateCookieName && cookie.MaxAge < 0 {
+		if cookie.Name == stateCookieName && cookie.MaxAge < 0 {
 			stateCleared = true
 		}
+		if cookie.Name == otherStateCookieName && cookie.MaxAge < 0 {
+			otherStateCleared = true
+		}
 	}
-	if !sessionCreated || !stateCleared {
-		t.Fatalf("sessionCreated=%v stateCleared=%v", sessionCreated, stateCleared)
+	if !sessionCreated || !stateCleared || !otherStateCleared {
+		t.Fatalf("sessionCreated=%v stateCleared=%v otherStateCleared=%v", sessionCreated, stateCleared, otherStateCleared)
 	}
 }
 
@@ -188,11 +197,73 @@ func TestCallbackRejectsBrowserStateMismatchBeforeRedeem(t *testing.T) {
 	}
 
 	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=one-time-code&state=attacker-state", nil)
-	request.AddCookie(&http.Cookie{Name: config.StateCookieName, Value: "browser-state"})
+	validStateCookieName := handler.(*CookieAuth).stateCookieNameFor("browser-state")
+	request.AddCookie(&http.Cookie{Name: validStateCookieName, Value: "browser-state"})
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 
 	if response.Code != http.StatusUnauthorized || redeemCalled {
 		t.Fatalf("status=%d redeemCalled=%v", response.Code, redeemCalled)
+	}
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == validStateCookieName && cookie.MaxAge < 0 {
+			t.Fatal("mismatched callback cleared an unrelated state cookie")
+		}
+	}
+}
+
+func TestConcurrentAuthorizationRequestsUseDifferentStateCookies(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stateCookies := make(map[string]string)
+	for _, path := range []string{"/private", "/favicon.ico"} {
+		request := httptest.NewRequest(http.MethodGet, "https://service.example.org"+path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		cookies := response.Result().Cookies()
+		if len(cookies) != 1 {
+			t.Fatalf("%s produced %d cookies, want 1", path, len(cookies))
+		}
+		stateCookies[cookies[0].Name] = cookies[0].Value
+	}
+
+	if len(stateCookies) != 2 {
+		t.Fatalf("concurrent requests produced %d distinct state cookies, want 2", len(stateCookies))
+	}
+	for name, state := range stateCookies {
+		if name != handler.(*CookieAuth).stateCookieNameFor(state) {
+			t.Fatalf("cookie %q does not match its state", name)
+		}
+	}
+}
+
+func TestCallbackRejectsLegacyStateCookie(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = "https://login.example.net/redeem"
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=one-time-code&state=browser-state", nil)
+	request.AddCookie(&http.Cookie{Name: config.StateCookieName, Value: "browser-state"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("legacy state cookie returned status %d, want 401", response.Code)
 	}
 }

@@ -15,7 +15,7 @@ The middleware trusts a successful code redemption response from the configured 
 
 ## Authorization request
 
-For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It generates 32 random bytes, stores the Base64URL value in a temporary host-only `HttpOnly` cookie, and redirects to `authorizationURL`. The original URL is placed in `returnURLParameter` and the random value in `stateParameter`.
+For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It generates 32 random bytes, stores the Base64URL value in a temporary host-only `HttpOnly` cookie whose name is derived from the state, and redirects to `authorizationURL`. The original URL is placed in `returnURLParameter` and the random value in `stateParameter`. Flow-specific cookie names allow multiple authorization requests from the same browser to remain pending without overwriting each other.
 
 The portal must treat the return URL as untrusted input. It must validate the scheme, origin, callback path, and service registration before presenting or completing authorization. A suffix-only hostname check is not sufficient for a general-purpose deployment. The portal must preserve the state value and bind it to the authorization grant.
 
@@ -51,7 +51,7 @@ Codes must be:
 
 ## Code redemption
 
-The middleware intercepts `callbackPath`; the upstream service never receives this request. Before redemption, it compares the callback state with the temporary host-only cookie using a constant-time comparison and consumes the cookie. A missing or mismatched value is rejected without contacting the portal. It then sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST.
+The middleware intercepts `callbackPath`; the upstream service never receives this request. Before redemption, it derives the flow-specific cookie name from the callback state, compares the callback state with that temporary host-only cookie using a constant-time comparison, and consumes the cookie. A missing or mismatched value is rejected without contacting the portal. It then sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST. After a successful authorization, every remaining pending state cookie sent by the browser is cleared.
 
 The portal must perform an atomic lookup-and-delete operation. Concurrent redemption attempts for the same code must result in at most one successful response.
 
@@ -147,7 +147,7 @@ This middleware controls whether a request may reach an upstream service. It doe
 
 ## Browser binding with state
 
-The temporary state cookie binds the authorization grant to the browser that initiated the flow. A callback URL copied to another browser fails because that browser does not possess the matching host-only `HttpOnly` cookie. Authenticated redemption also confirms that the portal bound the same state to the one-time code.
+The temporary state cookie binds the authorization grant to the browser that initiated the flow. Its name consists of the configured prefix and the Base64URL-encoded SHA-256 digest of the state. A callback URL copied to another browser fails because that browser does not possess the matching host-only `HttpOnly` cookie. Authenticated redemption also confirms that the portal bound the same state to the one-time code.
 
 State is consumed when callback processing starts. A failed or interrupted redeem therefore requires a new authorization flow. This fail-closed behavior prevents repeated attempts with the same browser state.
 
