@@ -53,7 +53,7 @@ Codes must be:
 
 ## Code redemption
 
-The middleware intercepts `callbackPath`; the upstream service never receives this request. Before redemption, it derives the flow-specific cookie name from the callback state, compares the callback state with that temporary host-only cookie using a constant-time comparison, and consumes the cookie. A missing or mismatched value is rejected without contacting the portal. It then sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST. When `redeemURL` is omitted, the complete `authorizationURL` is used. After a successful authorization, every remaining pending state cookie sent by the browser is cleared.
+The middleware intercepts `callbackPath`; the upstream service never receives this request. If the browser already has a valid session, a stale callback is ignored and redirected to the configured protected path without redemption. Otherwise, the middleware derives the flow-specific cookie name from the callback state, compares the callback state with that temporary host-only cookie using a constant-time comparison, and consumes only that cookie. A missing or mismatched value is rejected without contacting the portal. It then sends the code to `redeemURL` as an `application/x-www-form-urlencoded` POST. When `redeemURL` is omitted, the complete `authorizationURL` is used. Other pending state cookies remain available for their own callbacks until they expire.
 
 The portal must perform an atomic lookup-and-delete operation. Concurrent redemption attempts for the same code must result in at most one successful response.
 

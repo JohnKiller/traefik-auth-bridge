@@ -122,7 +122,7 @@ The portal must implement two endpoints.
 
 ### Authorization endpoint
 
-The browser is redirected to `authorizationURL`. The query parameter configured by `returnURLParameter` contains the original absolute URL, and `stateParameter` contains a cryptographically random value tied to a temporary host-only browser cookie. Each pending flow uses a distinct cookie so concurrent requests cannot overwrite one another. State cookies expire after `stateTTL` seconds and all remaining pending state cookies are cleared after a successful authorization.
+The browser is redirected to `authorizationURL`. The query parameter configured by `returnURLParameter` contains the original absolute URL, and `stateParameter` contains a cryptographically random value tied to a temporary host-only browser cookie. Each pending flow uses a distinct cookie so concurrent requests cannot overwrite one another. Each callback consumes only its own state cookie; other pending flows remain usable until their callback arrives or their `stateTTL` expires.
 
 After authenticating and authorizing the user, the portal must:
 

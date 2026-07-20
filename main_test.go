@@ -256,8 +256,44 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 			otherStateCleared = true
 		}
 	}
-	if !sessionCreated || !stateCleared || !otherStateCleared {
+	if !sessionCreated || !stateCleared || otherStateCleared {
 		t.Fatalf("sessionCreated=%v stateCleared=%v otherStateCleared=%v", sessionCreated, stateCleared, otherStateCleared)
+	}
+}
+
+func TestAuthenticatedCallbackIgnoresInvalidState(t *testing.T) {
+	redeemCalled := false
+	redeemServer := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		redeemCalled = true
+	}))
+	defer redeemServer.Close()
+
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.RedeemURL = redeemServer.URL
+	config.ProtectedPath = "/private"
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	middleware := handler.(*CookieAuth)
+
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=stale-code&state=invalid-state", nil)
+	request.AddCookie(&http.Cookie{Name: config.CookieName, Value: middleware.newCookieValue(time.Now().Add(time.Hour).Unix())})
+	unrelatedStateCookieName := middleware.stateCookieNameFor("other-browser-state")
+	request.AddCookie(&http.Cookie{Name: unrelatedStateCookieName, Value: "other-browser-state"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusSeeOther || response.Header().Get("Location") != config.ProtectedPath || redeemCalled {
+		t.Fatalf("status=%d location=%q redeemCalled=%v", response.Code, response.Header().Get("Location"), redeemCalled)
+	}
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == unrelatedStateCookieName && cookie.MaxAge < 0 {
+			t.Fatal("authenticated callback cleared an unrelated state cookie")
+		}
 	}
 }
 
