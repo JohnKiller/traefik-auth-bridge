@@ -115,6 +115,21 @@ func TestInlineMasterKey(t *testing.T) {
 	}
 }
 
+func TestRedeemURLDefaultsToAuthorizationURL(t *testing.T) {
+	config := CreateConfig()
+	config.ServiceID = "service-a"
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize?prompt=login"
+
+	handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := handler.(*CookieAuth).redeemURL; got != config.AuthorizationURL {
+		t.Fatalf("redeemURL=%q, want %q", got, config.AuthorizationURL)
+	}
+}
+
 func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
 	config := CreateConfig()
 	config.ServiceID = "service-a"

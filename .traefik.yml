@@ -11,5 +11,4 @@ testData:
   returnURLParameter: rd
   callbackPath: /_auth/callback
   authorizationCodeParameter: code
-  redeemURL: https://login.example.com/redeem
   redeemCodeParameter: code

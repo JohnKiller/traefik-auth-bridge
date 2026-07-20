@@ -100,9 +100,6 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	if config.CallbackPath == "" || config.CallbackPath[0] != '/' {
 		return nil, fmt.Errorf("callbackPath must start with /")
 	}
-	if config.RedeemURL == "" {
-		return nil, fmt.Errorf("redeemURL is required")
-	}
 	if config.AuthorizationCodeParameter == "" {
 		return nil, fmt.Errorf("authorizationCodeParameter is required")
 	}
@@ -141,6 +138,10 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	if err != nil || authorizationURL.Scheme == "" || authorizationURL.Host == "" {
 		return nil, fmt.Errorf("authorizationURL must be an absolute URL")
 	}
+	redeemURL := config.RedeemURL
+	if redeemURL == "" {
+		redeemURL = config.AuthorizationURL
+	}
 	protectedPath := strings.TrimRight(config.ProtectedPath, "/")
 	if protectedPath == "" {
 		protectedPath = "/"
@@ -165,7 +166,7 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		protectedPathPrefix:        protectedPathPrefix,
 		callbackPath:               config.CallbackPath,
 		authorizationCodeParameter: config.AuthorizationCodeParameter,
-		redeemURL:                  config.RedeemURL,
+		redeemURL:                  redeemURL,
 		redeemCodeParameter:        config.RedeemCodeParameter,
 		httpClient:                 &http.Client{Timeout: 5 * time.Second},
 	}, nil
