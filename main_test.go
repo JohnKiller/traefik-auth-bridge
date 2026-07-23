@@ -13,31 +13,70 @@ import (
 
 func TestSignedCookie(t *testing.T) {
 	middleware := &CookieAuth{
-		serviceID:  "service-a",
 		signingKey: []byte("01234567890123456789012345678901"),
 	}
 
-	value := middleware.newCookieValue(time.Now().Add(time.Hour).Unix())
-	if !middleware.validCookie(value, time.Now()) {
+	value := middleware.newCookieValue("service.example.org", time.Now().Add(time.Hour).Unix())
+	if !middleware.validCookie(value, "service.example.org", time.Now()) {
 		t.Fatal("newly created cookie was rejected")
 	}
-	if middleware.validCookie(value+"A", time.Now()) {
+	if middleware.validCookie(value+"A", "service.example.org", time.Now()) {
 		t.Fatal("tampered cookie was accepted")
 	}
 
-	expired := middleware.newCookieValue(time.Now().Add(-time.Second).Unix())
-	if middleware.validCookie(expired, time.Now()) {
+	expired := middleware.newCookieValue("service.example.org", time.Now().Add(-time.Second).Unix())
+	if middleware.validCookie(expired, "service.example.org", time.Now()) {
 		t.Fatal("expired cookie was accepted")
 	}
 }
 
-func TestServiceKeyIsolation(t *testing.T) {
+func TestHostnameIsolation(t *testing.T) {
 	expires := time.Now().Add(time.Hour).Unix()
-	first := &CookieAuth{serviceID: "service-a", signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
-	second := &CookieAuth{serviceID: "service-b", signingKey: []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")}
+	middleware := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
+	value := middleware.newCookieValue("first.example.org", expires)
 
-	if second.validCookie(first.newCookieValue(expires), time.Now()) {
-		t.Fatal("cookie from another service was accepted")
+	if middleware.validCookie(value, "second.example.org", time.Now()) {
+		t.Fatal("cookie from another hostname was accepted")
+	}
+}
+
+func TestSigningKeyIsolation(t *testing.T) {
+	expires := time.Now().Add(time.Hour).Unix()
+	first := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
+	second := &CookieAuth{signingKey: []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")}
+	value := first.newCookieValue("service.example.org", expires)
+
+	if second.validCookie(value, "service.example.org", time.Now()) {
+		t.Fatal("cookie signed by another middleware key was accepted")
+	}
+}
+
+func TestLegacyCookieIsRejected(t *testing.T) {
+	middleware := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
+	if middleware.validCookie("v1.4102444800.invalid", "service.example.org", time.Now()) {
+		t.Fatal("legacy v1 cookie was accepted")
+	}
+}
+
+func TestCanonicalHostname(t *testing.T) {
+	for authority, want := range map[string]string{
+		"Service.Example.Org":      "service.example.org",
+		"service.example.org.":     "service.example.org",
+		"service.example.org:8443": "service.example.org",
+		"[2001:db8::1]:443":        "2001:db8::1",
+	} {
+		got, err := canonicalHostname(authority)
+		if err != nil {
+			t.Errorf("canonicalHostname(%q): %v", authority, err)
+		} else if got != want {
+			t.Errorf("canonicalHostname(%q)=%q, want %q", authority, got, want)
+		}
+	}
+
+	for _, authority := range []string{"", "user@example.org", "example.org/path", "example.org:invalid"} {
+		if _, err := canonicalHostname(authority); err == nil {
+			t.Errorf("canonicalHostname(%q) unexpectedly succeeded", authority)
+		}
 	}
 }
 
@@ -54,7 +93,6 @@ func TestAuthorizationRedirectUsesConfiguredParameter(t *testing.T) {
 	}
 
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKeyFile = keyFile.Name()
 	config.AuthorizationURL = "https://login.example.net/authorize?prompt=login"
 	config.ReturnURLParameter = "return_to"
@@ -103,9 +141,71 @@ func TestAuthorizationRedirectUsesConfiguredParameter(t *testing.T) {
 	}
 }
 
+func TestInvalidRequestHostIsRejected(t *testing.T) {
+	config := CreateConfig()
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+
+	upstreamCalled := false
+	handler, err := New(context.Background(), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamCalled = true
+	}), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/", nil)
+	request.Host = ""
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest || upstreamCalled {
+		t.Fatalf("status=%d upstreamCalled=%v", response.Code, upstreamCalled)
+	}
+	if response.Header().Get("Location") != "" || len(response.Result().Cookies()) != 0 {
+		t.Fatal("invalid host produced a redirect or cookie")
+	}
+}
+
+func TestSessionCookieIsBoundToCanonicalRequestHostname(t *testing.T) {
+	config := CreateConfig()
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+
+	upstreamCalls := 0
+	handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		upstreamCalls++
+		rw.WriteHeader(http.StatusNoContent)
+	}), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	middleware := handler.(*CookieAuth)
+	value := middleware.newCookieValue("service.example.org", time.Now().Add(time.Hour).Unix())
+
+	sameHostRequest := httptest.NewRequest(http.MethodGet, "https://service.example.org/", nil)
+	sameHostRequest.Host = "SERVICE.EXAMPLE.ORG.:8443"
+	sameHostRequest.AddCookie(&http.Cookie{Name: config.CookieName, Value: value})
+	sameHostResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sameHostResponse, sameHostRequest)
+	if sameHostResponse.Code != http.StatusNoContent {
+		t.Fatalf("canonical equivalent host returned %d, want 204", sameHostResponse.Code)
+	}
+
+	otherHostRequest := httptest.NewRequest(http.MethodGet, "https://other.example.org/", nil)
+	otherHostRequest.AddCookie(&http.Cookie{Name: config.CookieName, Value: value})
+	otherHostResponse := httptest.NewRecorder()
+	handler.ServeHTTP(otherHostResponse, otherHostRequest)
+	if otherHostResponse.Code != http.StatusFound {
+		t.Fatalf("different host returned %d, want 302", otherHostResponse.Code)
+	}
+	if upstreamCalls != 1 {
+		t.Fatalf("upstream called %d times, want 1", upstreamCalls)
+	}
+}
+
 func TestInlineMasterKey(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = "https://login.example.net/redeem"
@@ -117,7 +217,6 @@ func TestInlineMasterKey(t *testing.T) {
 
 func TestRedeemURLDefaultsToAuthorizationURL(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize?prompt=login"
 
@@ -132,7 +231,6 @@ func TestRedeemURLDefaultsToAuthorizationURL(t *testing.T) {
 
 func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.MasterKeyFile = "/run/secrets/master-key"
 	config.AuthorizationURL = "https://login.example.net/authorize"
@@ -145,7 +243,6 @@ func TestMasterKeySourcesAreMutuallyExclusive(t *testing.T) {
 
 func TestProtectedPathOnlyAuthenticatesConfiguredSubtree(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = "https://login.example.net/redeem"
@@ -189,7 +286,6 @@ func TestProtectedPathOnlyAuthenticatesConfiguredSubtree(t *testing.T) {
 
 func TestProtectedPathValidationAndNormalization(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = "https://login.example.net/redeem"
@@ -223,7 +319,6 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	defer redeemServer.Close()
 
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = redeemServer.URL
@@ -246,7 +341,7 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	}
 	var sessionCreated, stateCleared, otherStateCleared bool
 	for _, cookie := range response.Result().Cookies() {
-		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v1.") {
+		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v2.") {
 			sessionCreated = true
 		}
 		if cookie.Name == stateCookieName && cookie.MaxAge < 0 {
@@ -269,7 +364,6 @@ func TestAuthenticatedCallbackIgnoresInvalidState(t *testing.T) {
 	defer redeemServer.Close()
 
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = redeemServer.URL
@@ -281,7 +375,7 @@ func TestAuthenticatedCallbackIgnoresInvalidState(t *testing.T) {
 	middleware := handler.(*CookieAuth)
 
 	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=stale-code&state=invalid-state", nil)
-	request.AddCookie(&http.Cookie{Name: config.CookieName, Value: middleware.newCookieValue(time.Now().Add(time.Hour).Unix())})
+	request.AddCookie(&http.Cookie{Name: config.CookieName, Value: middleware.newCookieValue("service.example.org", time.Now().Add(time.Hour).Unix())})
 	unrelatedStateCookieName := middleware.stateCookieNameFor("other-browser-state")
 	request.AddCookie(&http.Cookie{Name: unrelatedStateCookieName, Value: "other-browser-state"})
 	response := httptest.NewRecorder()
@@ -305,7 +399,6 @@ func TestCallbackRejectsBrowserStateMismatchBeforeRedeem(t *testing.T) {
 	defer redeemServer.Close()
 
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = redeemServer.URL
@@ -332,7 +425,6 @@ func TestCallbackRejectsBrowserStateMismatchBeforeRedeem(t *testing.T) {
 
 func TestConcurrentAuthorizationRequestsUseDifferentStateCookies(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = "https://login.example.net/redeem"
@@ -367,7 +459,6 @@ func TestConcurrentAuthorizationRequestsUseDifferentStateCookies(t *testing.T) {
 
 func TestCallbackRejectsLegacyStateCookie(t *testing.T) {
 	config := CreateConfig()
-	config.ServiceID = "service-a"
 	config.MasterKey = "01234567890123456789012345678901"
 	config.AuthorizationURL = "https://login.example.net/authorize"
 	config.RedeemURL = "https://login.example.net/redeem"

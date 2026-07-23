@@ -22,7 +22,6 @@ import (
 type Config struct {
 	CookieName                 string `json:"cookieName,omitempty"`
 	CookieTTL                  int    `json:"cookieTTL,omitempty"`
-	ServiceID                  string `json:"serviceID,omitempty"`
 	MasterKey                  string `json:"masterKey,omitempty"`
 	MasterKeyFile              string `json:"masterKeyFile,omitempty"`
 	AuthorizationURL           string `json:"authorizationURL,omitempty"`
@@ -58,7 +57,6 @@ type CookieAuth struct {
 	next                       http.Handler
 	cookieName                 string
 	cookieTTL                  int
-	serviceID                  string
 	signingKey                 []byte
 	authorizationURL           *url.URL
 	returnURLParameter         string
@@ -109,9 +107,6 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 	if config.CookieTTL <= 0 {
 		return nil, fmt.Errorf("cookieTTL must be greater than zero")
 	}
-	if config.ServiceID == "" {
-		return nil, fmt.Errorf("serviceID is required")
-	}
 	if config.MasterKey == "" && config.MasterKeyFile == "" {
 		return nil, fmt.Errorf("one of masterKey or masterKeyFile is required")
 	}
@@ -131,7 +126,7 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		return nil, fmt.Errorf("master key must contain at least 32 bytes")
 	}
 	keyDerivation := hmac.New(sha256.New, masterKey)
-	keyDerivation.Write([]byte("traefik-cookie-auth:key:v1:" + config.ServiceID))
+	keyDerivation.Write([]byte("traefik-cookie-auth:key:v2"))
 	signingKey := keyDerivation.Sum(nil)
 
 	authorizationURL, err := url.Parse(config.AuthorizationURL)
@@ -155,7 +150,6 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		next:                       next,
 		cookieName:                 config.CookieName,
 		cookieTTL:                  config.CookieTTL,
-		serviceID:                  config.ServiceID,
 		signingKey:                 signingKey,
 		authorizationURL:           authorizationURL,
 		returnURLParameter:         config.ReturnURLParameter,
@@ -174,12 +168,18 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 
 // ServeHTTP allows authenticated requests and redirects all others to login.
 func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	hostname, err := canonicalHostname(req.Host)
+	if err != nil {
+		http.Error(rw, "invalid request host", http.StatusBadRequest)
+		return
+	}
+
 	if req.URL.Path == m.callbackPath {
-		if m.hasValidSession(req, time.Now()) {
+		if m.hasValidSession(req, hostname, time.Now()) {
 			m.handleAuthenticatedCallback(rw, req)
 			return
 		}
-		m.handleCallback(rw, req)
+		m.handleCallback(rw, req, hostname)
 		return
 	}
 	if m.protectedPath != "/" && req.URL.Path != m.protectedPath && !strings.HasPrefix(req.URL.Path, m.protectedPathPrefix) {
@@ -187,7 +187,7 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if m.hasValidSession(req, time.Now()) {
+	if m.hasValidSession(req, hostname, time.Now()) {
 		m.next.ServeHTTP(rw, req)
 		return
 	}
@@ -224,14 +224,14 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	http.Redirect(rw, req, redirectURL.String(), http.StatusFound)
 }
 
-func (m *CookieAuth) hasValidSession(req *http.Request, now time.Time) bool {
+func (m *CookieAuth) hasValidSession(req *http.Request, hostname string, now time.Time) bool {
 	cookie, err := req.Cookie(m.cookieName)
-	return err == nil && m.validCookie(cookie.Value, now)
+	return err == nil && m.validCookie(cookie.Value, hostname, now)
 }
 
-func (m *CookieAuth) validCookie(value string, now time.Time) bool {
+func (m *CookieAuth) validCookie(value, hostname string, now time.Time) bool {
 	parts := strings.Split(value, ".")
-	if len(parts) != 3 || parts[0] != "v1" {
+	if len(parts) != 3 || parts[0] != "v2" {
 		return false
 	}
 	expiresAt, err := strconv.ParseInt(parts[1], 10, 64)
@@ -242,22 +242,22 @@ func (m *CookieAuth) validCookie(value string, now time.Time) bool {
 	if err != nil {
 		return false
 	}
-	expectedMAC := m.cookieMAC(parts[1])
+	expectedMAC := m.cookieMAC(hostname, parts[1])
 	return hmac.Equal(suppliedMAC, expectedMAC)
 }
 
-func (m *CookieAuth) cookieMAC(expiresAt string) []byte {
+func (m *CookieAuth) cookieMAC(hostname, expiresAt string) []byte {
 	mac := hmac.New(sha256.New, m.signingKey)
-	mac.Write([]byte("traefik-cookie-auth:cookie:v1:" + m.serviceID + ":" + expiresAt))
+	mac.Write([]byte("traefik-cookie-auth:cookie:v2:" + hostname + ":" + expiresAt))
 	return mac.Sum(nil)
 }
 
-func (m *CookieAuth) newCookieValue(expiresAt int64) string {
+func (m *CookieAuth) newCookieValue(hostname string, expiresAt int64) string {
 	expires := strconv.FormatInt(expiresAt, 10)
-	return "v1." + expires + "." + base64.RawURLEncoding.EncodeToString(m.cookieMAC(expires))
+	return "v2." + expires + "." + base64.RawURLEncoding.EncodeToString(m.cookieMAC(hostname, expires))
 }
 
-func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
+func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request, hostname string) {
 	code := req.URL.Query().Get(m.authorizationCodeParameter)
 	if code == "" {
 		http.Error(rw, "missing authorization code", http.StatusUnauthorized)
@@ -322,7 +322,7 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 	expiresAt := time.Now().Add(time.Duration(m.cookieTTL) * time.Second)
 	http.SetCookie(rw, &http.Cookie{
 		Name:     m.cookieName,
-		Value:    m.newCookieValue(expiresAt.Unix()),
+		Value:    m.newCookieValue(hostname, expiresAt.Unix()),
 		Path:     "/",
 		MaxAge:   m.cookieTTL,
 		Expires:  expiresAt.UTC(),
@@ -332,6 +332,21 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request) {
 	})
 	rw.Header().Set("Cache-Control", "no-store")
 	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
+}
+
+func canonicalHostname(authority string) (string, error) {
+	if authority == "" {
+		return "", fmt.Errorf("host is empty")
+	}
+	parsed, err := url.Parse("//" + authority)
+	if err != nil || parsed.Host != authority || parsed.User != nil {
+		return "", fmt.Errorf("host is malformed")
+	}
+	hostname := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if hostname == "" {
+		return "", fmt.Errorf("hostname is empty")
+	}
+	return hostname, nil
 }
 
 func (m *CookieAuth) handleAuthenticatedCallback(rw http.ResponseWriter, req *http.Request) {

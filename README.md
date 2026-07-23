@@ -63,7 +63,6 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 
 | Option | Required | Default | Description |
 | --- | --- | --- | --- |
-| `serviceID` | yes | — | Stable, unique identifier used to derive the service-specific HMAC key. |
 | `masterKeyFile` | one of the two | — | File containing at least 32 bytes of random master key material. Recommended for production. |
 | `masterKey` | one of the two | — | Inline master key of at least 32 bytes. Intended for testing because configuration systems may expose it. |
 | `authorizationURL` | yes | — | Absolute URL of the portal authorization page. Existing query parameters are preserved. |
@@ -85,7 +84,6 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 labels:
   - traefik.enable=true
   - traefik.http.routers.app.middlewares=app-auth
-  - traefik.http.middlewares.app-auth.plugin.authbridge.serviceID=my-service
   - traefik.http.middlewares.app-auth.plugin.authbridge.masterKeyFile=/run/secrets/auth-cookie-master-key
   - traefik.http.middlewares.app-auth.plugin.authbridge.authorizationURL=https://login.example.net/authorize
   - traefik.http.middlewares.app-auth.plugin.authbridge.returnURLParameter=return_to
@@ -97,6 +95,23 @@ labels:
   - traefik.http.middlewares.app-auth.plugin.authbridge.redeemCodeParameter=code
   - traefik.http.middlewares.app-auth.plugin.authbridge.cookieTTL=3600
 ```
+
+The middleware can instead be defined once in the file provider and reused by
+routers from other providers:
+
+```yaml
+http:
+  middlewares:
+    sso-auth:
+      plugin:
+        authbridge:
+          masterKeyFile: /run/secrets/auth-cookie-master-key
+          authorizationURL: https://login.example.net/authorize
+```
+
+Reference it from a Docker or Consul Catalog router as `sso-auth@file`. A router
+that needs a different master key can define and use a separate middleware
+through its own provider as shown in the labels example above.
 
 Mount the master key only in the Traefik container:
 
@@ -177,9 +192,16 @@ Use ForwardAuth when authorization must be evaluated centrally on every request,
 
 ## Multiple services and domains
 
-Use a distinct `serviceID` for each security boundary. The plugin derives a separate HMAC key from the shared master key and `serviceID`.
+Session cookies are cryptographically bound to the canonical request hostname.
+A cookie issued for one hostname is rejected on another hostname, even when the
+same middleware and master key are shared by both routers. The hostname comes
+from the HTTP `Host`/`:authority` value; forwarded host headers are not trusted.
 
-A service may be exposed through multiple hostnames. Cookies are host-only, so each hostname receives its own cookie after completing the callback, while all hostnames may share the same `serviceID`.
+Routers on the same hostname share the host security boundary when they use the
+same middleware. They may use separate middleware instances with different
+master keys when isolation is required. If both sessions must coexist on the
+same hostname, configure distinct `cookieName` values as well, otherwise one
+middleware's cookie overwrites the other.
 
 ## License
 
