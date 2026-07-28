@@ -113,6 +113,11 @@ The default cookie is named `__Host-traefik-auth` and is issued with:
 Path=/; Secure; HttpOnly; SameSite=Lax
 ```
 
+By default it is a browser-session cookie: `Max-Age` and `Expires` are omitted,
+so the browser removes it when the browser session ends. Its signed expiration
+still limits validity to 24 hours. When `sessionCookie` is disabled, `Max-Age`
+and `Expires` are emitted with the configured `cookieTTL`.
+
 No `Domain` attribute is set. Each hostname therefore receives an independent host-only cookie.
 
 The cookie is authenticated but not encrypted. Its version and expiration are visible to the browser. They contain no secret information.

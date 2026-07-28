@@ -30,6 +30,43 @@ func TestSignedCookie(t *testing.T) {
 	}
 }
 
+func TestCookieDefaults(t *testing.T) {
+	config := CreateConfig()
+	if config.CookieTTL != 24*60*60 {
+		t.Fatalf("CookieTTL=%d, want 86400", config.CookieTTL)
+	}
+	if !config.SessionCookie {
+		t.Fatal("SessionCookie=false, want true")
+	}
+}
+
+func TestSessionCookieAttributes(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	middleware := &CookieAuth{
+		cookieName:    "__Host-traefik-auth",
+		cookieTTL:     24 * 60 * 60,
+		sessionCookie: true,
+		signingKey:    []byte("01234567890123456789012345678901"),
+	}
+
+	cookie := middleware.newSessionCookie("service.example.org", now)
+	if cookie.MaxAge != 0 || !cookie.Expires.IsZero() {
+		t.Fatalf("session cookie has MaxAge=%d Expires=%v", cookie.MaxAge, cookie.Expires)
+	}
+	if !middleware.validCookie(cookie.Value, "service.example.org", now.Add(23*time.Hour)) {
+		t.Fatal("session cookie expired before its signed 24-hour TTL")
+	}
+	if middleware.validCookie(cookie.Value, "service.example.org", now.Add(25*time.Hour)) {
+		t.Fatal("session cookie remained valid after its signed 24-hour TTL")
+	}
+
+	middleware.sessionCookie = false
+	cookie = middleware.newSessionCookie("service.example.org", now)
+	if cookie.MaxAge != 86400 || !cookie.Expires.Equal(now.Add(24*time.Hour).UTC()) {
+		t.Fatalf("persistent cookie has MaxAge=%d Expires=%v", cookie.MaxAge, cookie.Expires)
+	}
+}
+
 func TestHostnameIsolation(t *testing.T) {
 	expires := time.Now().Add(time.Hour).Unix()
 	middleware := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}

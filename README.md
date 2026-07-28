@@ -76,7 +76,8 @@ Traefik loads plugin source only during startup. Restart Traefik after changing 
 | `redeemURL` | no | `authorizationURL` | Portal endpoint called by the middleware to redeem a code. Defaults to the complete authorization URL when omitted. |
 | `redeemCodeParameter` | no | `code` | Form field used to send the code to `redeemURL`. |
 | `cookieName` | no | `__Host-traefik-auth` | Session cookie name. Keep the `__Host-` prefix unless its semantics are understood. |
-| `cookieTTL` | no | `3600` | Session lifetime in seconds. |
+| `cookieTTL` | no | `86400` | Maximum session lifetime in seconds, enforced by the signed cookie value. |
+| `sessionCookie` | no | `true` | When enabled, omit `Max-Age` and `Expires` so the browser removes the cookie when it closes. Set to `false` to persist it for `cookieTTL`. |
 
 ### Docker labels
 
@@ -93,7 +94,8 @@ labels:
   - traefik.http.middlewares.app-auth.plugin.authbridge.callbackPath=/_auth/callback
   - traefik.http.middlewares.app-auth.plugin.authbridge.authorizationCodeParameter=code
   - traefik.http.middlewares.app-auth.plugin.authbridge.redeemCodeParameter=code
-  - traefik.http.middlewares.app-auth.plugin.authbridge.cookieTTL=3600
+  - traefik.http.middlewares.app-auth.plugin.authbridge.cookieTTL=86400
+  - traefik.http.middlewares.app-auth.plugin.authbridge.sessionCookie=true
 ```
 
 The middleware can instead be defined once in the file provider and reused by

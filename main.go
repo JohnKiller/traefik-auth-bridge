@@ -22,6 +22,7 @@ import (
 type Config struct {
 	CookieName                 string `json:"cookieName,omitempty"`
 	CookieTTL                  int    `json:"cookieTTL,omitempty"`
+	SessionCookie              bool   `json:"sessionCookie,omitempty"`
 	MasterKey                  string `json:"masterKey,omitempty"`
 	MasterKeyFile              string `json:"masterKeyFile,omitempty"`
 	AuthorizationURL           string `json:"authorizationURL,omitempty"`
@@ -40,7 +41,8 @@ type Config struct {
 func CreateConfig() *Config {
 	return &Config{
 		CookieName:                 "__Host-traefik-auth",
-		CookieTTL:                  3600,
+		CookieTTL:                  86400,
+		SessionCookie:              true,
 		ReturnURLParameter:         "rd",
 		StateParameter:             "state",
 		StateCookieName:            "__Host-traefik-auth-state",
@@ -57,6 +59,7 @@ type CookieAuth struct {
 	next                       http.Handler
 	cookieName                 string
 	cookieTTL                  int
+	sessionCookie              bool
 	signingKey                 []byte
 	authorizationURL           *url.URL
 	returnURLParameter         string
@@ -150,6 +153,7 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		next:                       next,
 		cookieName:                 config.CookieName,
 		cookieTTL:                  config.CookieTTL,
+		sessionCookie:              config.SessionCookie,
 		signingKey:                 signingKey,
 		authorizationURL:           authorizationURL,
 		returnURLParameter:         config.ReturnURLParameter,
@@ -319,19 +323,26 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request, h
 		return
 	}
 
-	expiresAt := time.Now().Add(time.Duration(m.cookieTTL) * time.Second)
-	http.SetCookie(rw, &http.Cookie{
+	http.SetCookie(rw, m.newSessionCookie(hostname, time.Now()))
+	rw.Header().Set("Cache-Control", "no-store")
+	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
+}
+
+func (m *CookieAuth) newSessionCookie(hostname string, now time.Time) *http.Cookie {
+	expiresAt := now.Add(time.Duration(m.cookieTTL) * time.Second)
+	cookie := &http.Cookie{
 		Name:     m.cookieName,
 		Value:    m.newCookieValue(hostname, expiresAt.Unix()),
 		Path:     "/",
-		MaxAge:   m.cookieTTL,
-		Expires:  expiresAt.UTC(),
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-	})
-	rw.Header().Set("Cache-Control", "no-store")
-	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
+	}
+	if !m.sessionCookie {
+		cookie.MaxAge = m.cookieTTL
+		cookie.Expires = expiresAt.UTC()
+	}
+	return cookie
 }
 
 func canonicalHostname(authority string) (string, error) {
