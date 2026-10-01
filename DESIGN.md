@@ -17,7 +17,7 @@ The middleware trusts a successful code redemption response from the configured 
 
 For a request without a valid cookie, the middleware builds the original absolute URL from the request scheme, host, path, and query string. It generates 32 random bytes, stores the Base64URL value in a temporary host-only `HttpOnly` cookie whose name is derived from the state, and redirects to `authorizationURL`. The original URL is placed in `returnURLParameter` and the random value in `stateParameter`. Flow-specific cookie names allow multiple authorization requests from the same browser to remain pending without overwriting each other.
 
-When `protectedPath` is narrower than `/`, requests outside that exact path segment and its descendants pass directly to the upstream without cookie inspection. The callback path is always intercepted, including when it lies outside the protected subtree.
+When `protectedPath` is narrower than `/`, requests outside that exact path segment and its descendants pass directly to the upstream without cookie inspection. Incoming `X-Auth-*` headers are removed on every route; authenticated identity is injected only within the protected subtree. The callback path is always intercepted, including when it lies outside the protected subtree.
 
 The portal must treat the return URL as untrusted input. It must validate the scheme, origin, callback path, and service registration before presenting or completing authorization. A suffix-only hostname check is not sufficient for a general-purpose deployment. The portal must preserve the state value and bind it to the authorization grant.
 
@@ -83,7 +83,7 @@ When `redeemURL` crosses an untrusted network, it must use HTTPS with normal cer
 After successful redemption, the middleware creates a cookie with this wire format:
 
 ```text
-v2.<unix-expiration>.<base64url-mac>
+v3.<unix-expiration>.<base64url-json-claims>.<base64url-mac>
 ```
 
 It derives a root signing key:
@@ -91,7 +91,7 @@ It derives a root signing key:
 ```text
 root_key = HMAC-SHA-256(
     master_key,
-    "traefik-cookie-auth:key:v2"
+    "traefik-cookie-auth:key:v3"
 )
 ```
 
@@ -100,7 +100,7 @@ The cookie MAC is bound to the canonical request hostname:
 ```text
 HMAC-SHA-256(
     root_key,
-    "traefik-cookie-auth:cookie:v2:" + canonical_hostname + ":" + unix_expiration
+    "traefik-cookie-auth:cookie:v3:" + canonical_hostname + ":" + unix_expiration + ":" + base64url_json_claims
 )
 ```
 
@@ -120,7 +120,15 @@ and `Expires` are emitted with the configured `cookieTTL`.
 
 No `Domain` attribute is set. Each hostname therefore receives an independent host-only cookie.
 
-The cookie is authenticated but not encrypted. Its version and expiration are visible to the browser. They contain no secret information.
+The cookie is authenticated but not encrypted. Its version, expiration, and JSON claims are readable by the browser. The claims contain every top-level redeem field except `active`, `rd`, and `state`; missing identity fields are allowed. Do not return backend secrets as session claims. The complete redeem body is limited to 8192 bytes; cookie values exceeding 3800 bytes or serialized cookies exceeding 4096 bytes are rejected before issuance.
+
+## Identity propagation
+
+After verifying the v3 cookie MAC and expiration, the middleware JSON-encodes each saved claim and writes it to `X-Auth-<field>` on the request sent upstream. Strings retain their JSON quotes; arrays, objects, numbers, booleans, and null retain their types. ASCII letters, digits, hyphens, and underscores are accepted in field names. Underscores become hyphens. Case-insensitive collisions or collisions after underscore conversion cause redemption to fail.
+
+All incoming request headers in the `X-Auth-` namespace, including underscore/dot aliases that CGI backends may normalize to the same names, are removed even outside the protected subtree. Claims are injected only on authenticated protected requests. Claims omitted by the portal cannot survive through client-supplied headers. Upstreams relying on identity headers must be accessible only through this middleware.
+
+Identity is a login-time snapshot. The portal is not contacted on subsequent requests; neither role changes nor identity updates are reflected until another login. An SSO-signed backend assertion may be carried as an ordinary claim, and a backend may submit it to an SSO endpoint for independent verification. The endpoint must check the assertion's signature, purpose, audience, expiration, and current user existence. The bridge's HMAC cookie and the SSO's RSA assertion are separate credentials with independently enforced lifetimes.
 
 ## Master key and hostname isolation
 
@@ -130,7 +138,7 @@ The mutually exclusive `masterKey` option accepts inline key material for catalo
 
 A cookie valid for one hostname is not valid for another, even when both hostnames use the same middleware and master key. This supplements the browser's host-only cookie enforcement by also rejecting a cookie that is copied into a manually constructed request for another host.
 
-Changing the master key or signed format invalidates existing cookies. Version 1 cookies are deliberately rejected; this project does not implement key rotation or compatibility with previous keys.
+Changing the master key or signed format invalidates existing cookies. Version 1 and 2 cookies are deliberately rejected; this project does not implement key rotation or compatibility with previous keys.
 
 Separate middleware instances may use different master keys when a router needs an independent security boundary. When they operate on the same hostname, they must also use different cookie names if both sessions need to coexist.
 

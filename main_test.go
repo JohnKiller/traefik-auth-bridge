@@ -2,6 +2,8 @@ package traefik_auth_bridge
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -90,8 +92,10 @@ func TestSigningKeyIsolation(t *testing.T) {
 
 func TestLegacyCookieIsRejected(t *testing.T) {
 	middleware := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
-	if middleware.validCookie("v1.4102444800.invalid", "service.example.org", time.Now()) {
-		t.Fatal("legacy v1 cookie was accepted")
+	for _, value := range []string{"v1.4102444800.invalid", "v2.4102444800.invalid"} {
+		if middleware.validCookie(value, "service.example.org", time.Now()) {
+			t.Fatalf("legacy cookie %q was accepted", value)
+		}
 	}
 }
 
@@ -378,7 +382,7 @@ func TestCallbackRedeemsStateAndCreatesSession(t *testing.T) {
 	}
 	var sessionCreated, stateCleared, otherStateCleared bool
 	for _, cookie := range response.Result().Cookies() {
-		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v2.") {
+		if cookie.Name == config.CookieName && strings.HasPrefix(cookie.Value, "v3.") {
 			sessionCreated = true
 		}
 		if cookie.Name == stateCookieName && cookie.MaxAge < 0 {
@@ -511,5 +515,165 @@ func TestCallbackRejectsLegacyStateCookie(t *testing.T) {
 
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("legacy state cookie returned status %d, want 401", response.Code)
+	}
+}
+
+func TestRedeemedClaimsReachBackend(t *testing.T) {
+	for _, extra := range []string{
+		``,
+		`,"email":"user@example.org","token":"signed-token","roles":["admin"],"profile":{"name":"Anna"},"enabled":true,"optional":null,"uid":9007199254740993,"user_id":42`,
+		`,"email":"quote\" and newline\n@example.org"`,
+	} {
+		t.Run(extra, func(t *testing.T) {
+			redeemCalls := 0
+			redeemServer := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				redeemCalls++
+				rw.Write([]byte(`{"active":true,"rd":"https://service.example.org/private","state":"browser-state"` + extra + `}`))
+			}))
+			defer redeemServer.Close()
+			var backendHeaders http.Header
+			config := CreateConfig()
+			config.MasterKey = "01234567890123456789012345678901"
+			config.AuthorizationURL = "https://login.example.net/authorize"
+			config.RedeemURL = redeemServer.URL
+			handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				backendHeaders = req.Header.Clone()
+				rw.WriteHeader(http.StatusNoContent)
+			}), config, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			callback := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=test&state=browser-state", nil)
+			callback.AddCookie(&http.Cookie{Name: handler.(*CookieAuth).stateCookieNameFor("browser-state"), Value: "browser-state"})
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, callback)
+			if response.Code != http.StatusSeeOther {
+				t.Fatalf("callback: %d %s", response.Code, response.Body.String())
+			}
+			var session *http.Cookie
+			for _, cookie := range response.Result().Cookies() {
+				if cookie.Name == config.CookieName {
+					session = cookie
+				}
+			}
+			if session == nil {
+				t.Fatal("no session cookie")
+			}
+			for i := 0; i < 2; i++ {
+				request := httptest.NewRequest(http.MethodGet, "https://service.example.org/private", nil)
+				request.AddCookie(session)
+				request.Header.Set("X-Auth-Email", `"attacker@example.org"`)
+				request.Header.Set("X-Auth-Unknown", `"spoofed"`)
+				request.Header["x-auth-token"] = []string{`"spoofed"`}
+				request.Header.Set("X_Auth_Unknown", `"spoofed"`)
+				request.Header.Set("X.Auth.Email", `"spoofed"`)
+				request.Header.Set("X-Other", "preserved")
+				result := httptest.NewRecorder()
+				handler.ServeHTTP(result, request)
+				if result.Code != http.StatusNoContent {
+					t.Fatalf("request: %d %s", result.Code, result.Body.String())
+				}
+				var expected map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(`{`+strings.TrimPrefix(extra, ",")+`}`), &expected); err != nil {
+					t.Fatal(err)
+				}
+				for name, raw := range expected {
+					encoded, _ := json.Marshal(raw)
+					if got := backendHeaders.Get("X-Auth-" + strings.ReplaceAll(name, "_", "-")); got != string(encoded) {
+						t.Errorf("%s=%q, want %s", name, got, encoded)
+					}
+				}
+				for _, name := range []string{"unknown", "active", "rd", "state"} {
+					if backendHeaders.Get("X-Auth-"+name) != "" {
+						t.Errorf("unexpected X-Auth-%s", name)
+					}
+				}
+				if len(expected) == 0 && (backendHeaders.Get("X-Auth-Email") != "" || backendHeaders.Get("X-Auth-Token") != "") {
+					t.Error("client identity was preserved without corresponding claims")
+				}
+				if backendHeaders.Get("X-Other") != "preserved" {
+					t.Error("unrelated header was removed")
+				}
+				if backendHeaders.Get("X_Auth_Unknown") != "" || backendHeaders.Get("X.Auth.Email") != "" {
+					t.Error("CGI header alias was preserved")
+				}
+			}
+			if redeemCalls != 1 {
+				t.Fatalf("redeem called %d times, want 1", redeemCalls)
+			}
+		})
+	}
+}
+
+func TestClaimsTamperingIsRejected(t *testing.T) {
+	middleware := &CookieAuth{signingKey: []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}
+	value := middleware.newCookieValue("service.example.org", time.Now().Add(time.Hour).Unix(), map[string]json.RawMessage{"email": json.RawMessage(`"user@example.org"`)})
+	parts := strings.Split(value, ".")
+	parts[2] = base64.RawURLEncoding.EncodeToString([]byte(`{"email":"attacker@example.org"}`))
+	if middleware.validCookie(strings.Join(parts, "."), "service.example.org", time.Now()) {
+		t.Fatal("modified identity was accepted")
+	}
+}
+
+func TestRejectInvalidOrOversizedClaims(t *testing.T) {
+	for _, extra := range []string{
+		`,"email":"a","Email":"b"`,
+		`,"bad key":true`,
+		`,"user_id":42,"user-id":99`,
+		`,"bad\r\nheader":true`,
+		`,"":true`,
+		`,"large":"` + strings.Repeat("a", 3500) + `"`,
+		`,"large":"` + strings.Repeat("a", 8200) + `"`,
+		`} {"unexpected":true`,
+	} {
+		t.Run(extra[:min(len(extra), 40)], func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+				rw.Write([]byte(`{"active":true,"rd":"https://service.example.org/private","state":"browser-state"` + extra + `}`))
+			}))
+			defer server.Close()
+			config := CreateConfig()
+			config.MasterKey = "01234567890123456789012345678901"
+			config.AuthorizationURL = "https://login.example.net/authorize"
+			config.RedeemURL = server.URL
+			handler, err := New(context.Background(), http.NotFoundHandler(), config, "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(http.MethodGet, "https://service.example.org/_auth/callback?code=test&state=browser-state", nil)
+			request.AddCookie(&http.Cookie{Name: handler.(*CookieAuth).stateCookieNameFor("browser-state"), Value: "browser-state"})
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("returned %d, want 502", response.Code)
+			}
+			for _, cookie := range response.Result().Cookies() {
+				if cookie.Name == config.CookieName {
+					t.Fatal("issued a session for invalid claims")
+				}
+			}
+		})
+	}
+}
+
+func TestUnprotectedRoutesRemoveAuthHeaders(t *testing.T) {
+	config := CreateConfig()
+	config.MasterKey = "01234567890123456789012345678901"
+	config.AuthorizationURL = "https://login.example.net/authorize"
+	config.ProtectedPath = "/private"
+	handler, err := New(context.Background(), http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.Header.Get("X-Auth-Email") != "" {
+			t.Error("client identity reached unprotected backend")
+		}
+		rw.WriteHeader(http.StatusNoContent)
+	}), config, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://service.example.org/public", nil)
+	request.Header.Set("X-Auth-Email", `"attacker@example.org"`)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("returned %d, want 204", response.Code)
 	}
 }

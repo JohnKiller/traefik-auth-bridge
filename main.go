@@ -129,7 +129,7 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 		return nil, fmt.Errorf("master key must contain at least 32 bytes")
 	}
 	keyDerivation := hmac.New(sha256.New, masterKey)
-	keyDerivation.Write([]byte("traefik-cookie-auth:key:v2"))
+	keyDerivation.Write([]byte("traefik-cookie-auth:key:v3"))
 	signingKey := keyDerivation.Sum(nil)
 
 	authorizationURL, err := url.Parse(config.AuthorizationURL)
@@ -172,6 +172,14 @@ func New(_ context.Context, next http.Handler, config *Config, _ string) (http.H
 
 // ServeHTTP allows authenticated requests and redirects all others to login.
 func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// Reserve the entire namespace, including on unprotected routes.
+	for name := range req.Header {
+		// CGI backends can map hyphens, underscores and dots to the same name.
+		normalized := strings.ReplaceAll(strings.ReplaceAll(strings.ToLower(name), "_", "-"), ".", "-")
+		if strings.HasPrefix(normalized, "x-auth-") {
+			delete(req.Header, name)
+		}
+	}
 	hostname, err := canonicalHostname(req.Host)
 	if err != nil {
 		http.Error(rw, "invalid request host", http.StatusBadRequest)
@@ -191,7 +199,11 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if m.hasValidSession(req, hostname, time.Now()) {
+	if claims, valid := m.sessionClaims(req, hostname, time.Now()); valid {
+		for name, value := range claims {
+			encoded, _ := json.Marshal(value)
+			req.Header.Set(claimHeaderName(name), string(encoded))
+		}
 		m.next.ServeHTTP(rw, req)
 		return
 	}
@@ -229,36 +241,86 @@ func (m *CookieAuth) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 func (m *CookieAuth) hasValidSession(req *http.Request, hostname string, now time.Time) bool {
+	_, valid := m.sessionClaims(req, hostname, now)
+	return valid
+}
+
+func (m *CookieAuth) sessionClaims(req *http.Request, hostname string, now time.Time) (map[string]json.RawMessage, bool) {
 	cookie, err := req.Cookie(m.cookieName)
-	return err == nil && m.validCookie(cookie.Value, hostname, now)
+	if err != nil {
+		return nil, false
+	}
+	return m.decodeCookie(cookie.Value, hostname, now)
 }
 
 func (m *CookieAuth) validCookie(value, hostname string, now time.Time) bool {
+	_, valid := m.decodeCookie(value, hostname, now)
+	return valid
+}
+
+func (m *CookieAuth) decodeCookie(value, hostname string, now time.Time) (map[string]json.RawMessage, bool) {
 	parts := strings.Split(value, ".")
-	if len(parts) != 3 || parts[0] != "v2" {
-		return false
+	if len(value) > 3800 || len(parts) != 4 || parts[0] != "v3" {
+		return nil, false
 	}
 	expiresAt, err := strconv.ParseInt(parts[1], 10, 64)
 	if err != nil || expiresAt <= now.Unix() {
-		return false
+		return nil, false
 	}
-	suppliedMAC, err := base64.RawURLEncoding.DecodeString(parts[2])
+	suppliedMAC, err := base64.RawURLEncoding.DecodeString(parts[3])
 	if err != nil {
-		return false
+		return nil, false
 	}
-	expectedMAC := m.cookieMAC(hostname, parts[1])
-	return hmac.Equal(suppliedMAC, expectedMAC)
+	if !hmac.Equal(suppliedMAC, m.cookieMAC(hostname, parts[1], parts[2])) {
+		return nil, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, false
+	}
+	var claims map[string]json.RawMessage
+	if json.Unmarshal(payload, &claims) != nil || claims == nil || !validClaims(claims) {
+		return nil, false
+	}
+	return claims, true
 }
 
-func (m *CookieAuth) cookieMAC(hostname, expiresAt string) []byte {
+// JSON keys must map unambiguously to case-insensitive HTTP header names.
+func claimHeaderName(name string) string {
+	return "X-Auth-" + strings.ReplaceAll(name, "_", "-")
+}
+
+func validClaims(claims map[string]json.RawMessage) bool {
+	seen := make(map[string]bool)
+	for name := range claims {
+		lower := strings.ToLower(claimHeaderName(name))
+		if name == "" || seen[lower] {
+			return false
+		}
+		for _, c := range name {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+		seen[lower] = true
+	}
+	return true
+}
+
+func (m *CookieAuth) cookieMAC(hostname, expiresAt, payload string) []byte {
 	mac := hmac.New(sha256.New, m.signingKey)
-	mac.Write([]byte("traefik-cookie-auth:cookie:v2:" + hostname + ":" + expiresAt))
+	mac.Write([]byte("traefik-cookie-auth:cookie:v3:" + hostname + ":" + expiresAt + ":" + payload))
 	return mac.Sum(nil)
 }
 
-func (m *CookieAuth) newCookieValue(hostname string, expiresAt int64) string {
+func (m *CookieAuth) newCookieValue(hostname string, expiresAt int64, claims ...map[string]json.RawMessage) string {
 	expires := strconv.FormatInt(expiresAt, 10)
-	return "v2." + expires + "." + base64.RawURLEncoding.EncodeToString(m.cookieMAC(hostname, expires))
+	data := []byte("{}")
+	if len(claims) > 0 {
+		data, _ = json.Marshal(claims[0])
+	}
+	payload := base64.RawURLEncoding.EncodeToString(data)
+	return "v3." + expires + "." + payload + "." + base64.RawURLEncoding.EncodeToString(m.cookieMAC(hostname, expires, payload))
 }
 
 func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request, hostname string) {
@@ -309,7 +371,9 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request, h
 		RD     string `json:"rd"`
 		State  string `json:"state"`
 	}
-	if err := json.NewDecoder(io.LimitReader(response.Body, 8192)).Decode(&grant); err != nil || !grant.Active {
+	body, err := io.ReadAll(io.LimitReader(response.Body, 8193))
+	var claims map[string]json.RawMessage
+	if err != nil || len(body) > 8192 || json.Unmarshal(body, &grant) != nil || !grant.Active || json.Unmarshal(body, &claims) != nil {
 		http.Error(rw, "invalid authorization response", http.StatusBadGateway)
 		return
 	}
@@ -323,16 +387,28 @@ func (m *CookieAuth) handleCallback(rw http.ResponseWriter, req *http.Request, h
 		return
 	}
 
-	http.SetCookie(rw, m.newSessionCookie(hostname, time.Now()))
+	delete(claims, "active")
+	delete(claims, "rd")
+	delete(claims, "state")
+	if !validClaims(claims) {
+		http.Error(rw, "invalid authorization claims", http.StatusBadGateway)
+		return
+	}
+	cookie := m.newSessionCookie(hostname, time.Now(), claims)
+	if len(cookie.Value) > 3800 || len(cookie.String()) > 4096 {
+		http.Error(rw, "authorization claims exceed cookie size limit", http.StatusBadGateway)
+		return
+	}
+	http.SetCookie(rw, cookie)
 	rw.Header().Set("Cache-Control", "no-store")
 	http.Redirect(rw, req, grant.RD, http.StatusSeeOther)
 }
 
-func (m *CookieAuth) newSessionCookie(hostname string, now time.Time) *http.Cookie {
+func (m *CookieAuth) newSessionCookie(hostname string, now time.Time, claims ...map[string]json.RawMessage) *http.Cookie {
 	expiresAt := now.Add(time.Duration(m.cookieTTL) * time.Second)
 	cookie := &http.Cookie{
 		Name:     m.cookieName,
-		Value:    m.newCookieValue(hostname, expiresAt.Unix()),
+		Value:    m.newCookieValue(hostname, expiresAt.Unix(), claims...),
 		Path:     "/",
 		Secure:   true,
 		HttpOnly: true,
